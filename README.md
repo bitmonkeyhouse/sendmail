@@ -1,6 +1,6 @@
 # email
 
-Small Go email sending package with SMTP, Resend, and in-memory mock senders.
+Small Go email sending package with SMTP, Resend, Mailgun, and in-memory mock senders.
 
 ```go
 package main
@@ -26,8 +26,12 @@ func main() {
 ## Senders
 
 - `email.NewResendSender(apiKey, defaultFrom)`
+- `email.NewMailgunSender(apiKey, domain, defaultFrom)`
+- `email.NewMailgunSenderWithConfig(apiKey, domain, defaultFrom, email.MailgunConfig{Region: email.MailgunRegionUS})`
 - `email.NewSMTPSender(host, port, user, password, defaultFrom)`
 - `email.NewMockSender()`
+
+Mailgun defaults to the EU API endpoint. Use `MailgunRegionUS` in `MailgunConfig` for US domains.
 
 All senders implement:
 
