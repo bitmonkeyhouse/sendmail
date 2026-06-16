@@ -177,28 +177,8 @@ func TestNewSender_Validation(t *testing.T) {
 			},
 			wantErr: "smtp port must be between 1 and 65535",
 		},
-		{
-			name: "missing smtp user",
-			config: Config{
-				Provider:     ProviderSMTP,
-				DefaultFrom:  "default@example.com",
-				SMTPHost:     "smtp.example.com",
-				SMTPPort:     587,
-				SMTPPassword: "password",
-			},
-			wantErr: "smtp user is required",
-		},
-		{
-			name: "missing smtp password",
-			config: Config{
-				Provider:    ProviderSMTP,
-				DefaultFrom: "default@example.com",
-				SMTPHost:    "smtp.example.com",
-				SMTPPort:    587,
-				SMTPUser:    "user",
-			},
-			wantErr: "smtp password is required",
-		},
+		// SMTP credentials are now optional (nil auth when absent, e.g. Mailpit),
+		// so the former "missing smtp user/password" error cases are removed.
 	}
 
 	for _, tt := range tests {

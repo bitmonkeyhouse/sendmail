@@ -86,12 +86,8 @@ func NewSender(config Config) (Sender, error) {
 		if config.SMTPPort < 1 || config.SMTPPort > 65535 {
 			return nil, fmt.Errorf("smtp port must be between 1 and 65535")
 		}
-		if isBlank(config.SMTPUser) {
-			return nil, fmt.Errorf("smtp user is required")
-		}
-		if isBlank(config.SMTPPassword) {
-			return nil, fmt.Errorf("smtp password is required")
-		}
+		// Credentials optional: absent (e.g. Mailpit with AUTH disabled) -> nil
+		// auth in the sender; present -> PLAIN auth.
 		return NewSMTPSender(config.SMTPHost, config.SMTPPort, config.SMTPUser, config.SMTPPassword, config.DefaultFrom), nil
 	}
 
