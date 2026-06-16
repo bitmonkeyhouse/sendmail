@@ -39,7 +39,13 @@ func (s *SMTPSender) Send(ctx context.Context, msg Message) error {
 	}
 
 	addr := fmt.Sprintf("%s:%d", s.host, s.port)
-	auth := smtp.PlainAuth("", s.user, s.password, s.host)
+	// Auth only when credentials are configured. Local dev servers (Mailpit)
+	// run AUTH-disabled and reject a PLAIN auth attempt with "server doesn't
+	// support AUTH"; nil auth skips the AUTH step entirely.
+	var auth smtp.Auth
+	if s.user != "" || s.password != "" {
+		auth = smtp.PlainAuth("", s.user, s.password, s.host)
+	}
 
 	boundary, err := randomBoundary()
 	if err != nil {
