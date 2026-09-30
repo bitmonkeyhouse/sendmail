@@ -1,4 +1,4 @@
-package email
+package sendmail
 
 import (
 	"context"
@@ -26,9 +26,9 @@ func TestResendSender_Integration(t *testing.T) {
 
 	msg := Message{
 		To:       to,
-		Subject:  "Integration Test from git.bit-monkey.io/bitmonkey/email",
-		HTMLBody: "<p>This is an integration test from git.bit-monkey.io/bitmonkey/email.</p>",
-		TextBody: "This is an integration test from git.bit-monkey.io/bitmonkey/email.",
+		Subject:  "Integration Test from github.com/bitmonkeyhouse/sendmail",
+		HTMLBody: "<p>This is an integration test from github.com/bitmonkeyhouse/sendmail.</p>",
+		TextBody: "This is an integration test from github.com/bitmonkeyhouse/sendmail.",
 	}
 
 	if err := sender.Send(context.Background(), msg); err != nil {

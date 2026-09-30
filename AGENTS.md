@@ -4,7 +4,7 @@ Guidance for agents working in this Go email package.
 
 ## Project Overview
 
-This module is `git.bit-monkey.io/bitmonkey/email`. It provides a small `email` package with:
+This module is `github.com/bitmonkeyhouse/sendmail`. It provides a small `sendmail` package with:
 
 - `Sender` interface and `Message` type in `email.go`
 - Resend HTTP sender in `resend.go`

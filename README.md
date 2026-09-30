@@ -1,4 +1,4 @@
-# email
+# sendmail
 
 Small Go email sending package with SMTP, Resend, Mailgun, and in-memory mock senders.
 
@@ -8,13 +8,13 @@ package main
 import (
     "context"
 
-    "git.bit-monkey.io/bitmonkey/email"
+    "github.com/bitmonkeyhouse/sendmail"
 )
 
 func main() {
-    sender := email.NewResendSender("re_...", "Steeev <noreply@example.com>")
+    sender := sendmail.NewResendSender("re_...", "Steeev <noreply@example.com>")
 
-    _ = sender.Send(context.Background(), email.Message{
+    _ = sender.Send(context.Background(), sendmail.Message{
         To:       "user@example.com",
         Subject:  "Welcome",
         HTMLBody: "<p>Hello!</p>",
@@ -29,25 +29,25 @@ Use the high-level factory methods when you want this package to choose the prov
 
 | Method | Function |
 | --- | --- |
-| `email.NewSender(config)` | Creates a `Sender` from `email.Config`, validates provider-specific settings, and returns the selected transport. Use this when your app already has parsed config. |
-| `email.NewSenderFromEnv()` | Reads environment variables, validates them, and returns the selected transport. Use this when you want provider switching to live entirely in this package. |
-| `email.NewResendSender(apiKey, defaultFrom)` | Creates a Resend HTTP sender directly. |
-| `email.NewResendSenderWithClient(apiKey, defaultFrom, client)` | Creates a Resend sender with a custom `http.Client`, mainly for tests. |
-| `email.NewMailgunSender(apiKey, domain, defaultFrom)` | Creates a Mailgun HTTP sender directly, using the EU endpoint by default. |
-| `email.NewMailgunSenderWithConfig(apiKey, domain, defaultFrom, config)` | Creates a Mailgun sender with Mailgun-specific config, such as `MailgunRegionUS`. |
-| `email.NewMailgunSenderWithClient(apiKey, domain, defaultFrom, client)` | Creates a Mailgun sender with a custom `http.Client`, mainly for tests. |
-| `email.NewSMTPSender(host, port, user, password, defaultFrom)` | Creates an SMTP sender using PLAIN auth. |
-| `email.NewMockSender()` | Creates an in-memory test double that records sent messages. |
+| `sendmail.NewSender(config)` | Creates a `Sender` from `sendmail.Config`, validates provider-specific settings, and returns the selected transport. Use this when your app already has parsed config. |
+| `sendmail.NewSenderFromEnv()` | Reads environment variables, validates them, and returns the selected transport. Use this when you want provider switching to live entirely in this package. |
+| `sendmail.NewResendSender(apiKey, defaultFrom)` | Creates a Resend HTTP sender directly. |
+| `sendmail.NewResendSenderWithClient(apiKey, defaultFrom, client)` | Creates a Resend sender with a custom `http.Client`, mainly for tests. |
+| `sendmail.NewMailgunSender(apiKey, domain, defaultFrom)` | Creates a Mailgun HTTP sender directly, using the EU endpoint by default. |
+| `sendmail.NewMailgunSenderWithConfig(apiKey, domain, defaultFrom, config)` | Creates a Mailgun sender with Mailgun-specific config, such as `MailgunRegionUS`. |
+| `sendmail.NewMailgunSenderWithClient(apiKey, domain, defaultFrom, client)` | Creates a Mailgun sender with a custom `http.Client`, mainly for tests. |
+| `sendmail.NewSMTPSender(host, port, user, password, defaultFrom)` | Creates an SMTP sender using PLAIN auth. |
+| `sendmail.NewMockSender()` | Creates an in-memory test double that records sent messages. |
 
-Mailgun defaults to the EU API endpoint. Use `email.MailgunRegionUS` in `email.MailgunConfig` for US domains.
+Mailgun defaults to the EU API endpoint. Use `sendmail.MailgunRegionUS` in `sendmail.MailgunConfig` for US domains.
 
 ### Config-based provider selection
 
 Use `NewSender` when you want provider switching in this package but prefer to parse configuration yourself:
 
 ```go
-sender, err := email.NewSender(email.Config{
-    Provider:     email.ProviderResend,
+sender, err := sendmail.NewSender(sendmail.Config{
+    Provider:     sendmail.ProviderResend,
     DefaultFrom:  "Your App <noreply@example.com>",
     ResendAPIKey: "re_...",
 })
@@ -60,16 +60,16 @@ err = sender.Send(ctx, msg)
 
 Provider constants are:
 
-- `email.ProviderResend`
-- `email.ProviderMailgun`
-- `email.ProviderSMTP`
+- `sendmail.ProviderResend`
+- `sendmail.ProviderMailgun`
+- `sendmail.ProviderSMTP`
 
 ### Environment-based provider selection
 
 Use `NewSenderFromEnv` when you want the package to read config and choose the provider:
 
 ```go
-sender, err := email.NewSenderFromEnv()
+sender, err := sendmail.NewSenderFromEnv()
 if err != nil {
     return err
 }
@@ -105,13 +105,5 @@ type Sender interface {
 
 Provider errors wrap either:
 
-- `email.ErrTransient` for retryable failures such as network errors, 5xx responses, or rate limits.
-- `email.ErrPermanent` for non-retryable failures such as invalid requests or 5xx-class SMTP permanent failures.
-
-## Private module setup
-
-For private Gitea usage, configure Go once on each machine:
-
-```sh
-go env -w GOPRIVATE=git.bit-monkey.io/bitmonkey/*
-```
+- `sendmail.ErrTransient` for retryable failures such as network errors, 5xx responses, or rate limits.
+- `sendmail.ErrPermanent` for non-retryable failures such as invalid requests or 5xx-class SMTP permanent failures.

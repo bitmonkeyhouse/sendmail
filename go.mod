@@ -1,3 +1,3 @@
-module git.bit-monkey.io/bitmonkey/email
+module github.com/bitmonkeyhouse/sendmail
 
 go 1.22
