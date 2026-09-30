@@ -1,3 +1,3 @@
 module github.com/bitmonkeyhouse/sendmail
 
-go 1.22
+go 1.26
