@@ -107,3 +107,7 @@ Provider errors wrap either:
 
 - `sendmail.ErrTransient` for retryable failures such as network errors, 5xx responses, or rate limits.
 - `sendmail.ErrPermanent` for non-retryable failures such as invalid requests or 5xx-class SMTP permanent failures.
+
+## Releases
+
+Every merged PR to `main` creates a GitHub release and version tag. Label the PR `semver:major` for breaking changes or `semver:minor` for new features; otherwise it gets a patch bump. If both labels are present, major wins.
