@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -111,9 +110,9 @@ func (s *MailgunSender) Send(ctx context.Context, msg Message) error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := readProviderResponse(resp.Body)
 	if err != nil {
-		return fmt.Errorf("%w: reading response: %v", ErrTransient, err)
+		return fmt.Errorf("mailgun: %w", err)
 	}
 
 	if resp.StatusCode >= 500 {
@@ -168,7 +167,7 @@ func newMailgunRequestBody(from string, msg Message) (*bytes.Buffer, string, err
 func mailgunErrorMessage(body []byte) string {
 	var errResp mailgunErrorResp
 	if err := json.Unmarshal(body, &errResp); err == nil && errResp.Message != "" {
-		return errResp.Message
+		return limitProviderDetail(errResp.Message)
 	}
-	return strings.TrimSpace(string(body))
+	return limitProviderDetail(strings.TrimSpace(string(body)))
 }

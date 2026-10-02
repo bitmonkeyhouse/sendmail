@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 )
@@ -89,27 +88,27 @@ func (s *ResendSender) Send(ctx context.Context, msg Message) error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := readProviderResponse(resp.Body)
 	if err != nil {
-		return fmt.Errorf("%w: reading response: %v", ErrTransient, err)
+		return fmt.Errorf("resend: %w", err)
 	}
 
 	if resp.StatusCode >= 500 {
 		var errResp resendErrorResp
 		_ = json.Unmarshal(respBody, &errResp)
-		return fmt.Errorf("%w: resend API error (status %d): %s", ErrTransient, resp.StatusCode, errResp.Message)
+		return fmt.Errorf("%w: resend API error (status %d): %s", ErrTransient, resp.StatusCode, limitProviderDetail(errResp.Message))
 	}
 
 	if resp.StatusCode == 429 {
 		var errResp resendErrorResp
 		_ = json.Unmarshal(respBody, &errResp)
-		return fmt.Errorf("%w: resend rate limited (status 429): %s", ErrTransient, errResp.Message)
+		return fmt.Errorf("%w: resend rate limited (status 429): %s", ErrTransient, limitProviderDetail(errResp.Message))
 	}
 
 	if resp.StatusCode >= 400 {
 		var errResp resendErrorResp
 		_ = json.Unmarshal(respBody, &errResp)
-		return fmt.Errorf("%w: resend API error (status %d): %s", ErrPermanent, resp.StatusCode, errResp.Message)
+		return fmt.Errorf("%w: resend API error (status %d): %s", ErrPermanent, resp.StatusCode, limitProviderDetail(errResp.Message))
 	}
 
 	return nil

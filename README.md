@@ -42,6 +42,21 @@ Use the high-level factory methods when you want this package to choose the prov
 
 Mailgun defaults to the EU API endpoint. Use `sendmail.MailgunRegionUS` in `sendmail.MailgunConfig` for US domains.
 
+### HTTP-provider response limits
+
+Resend and Mailgun accept response bodies up to 64 KiB. Larger responses return
+`ErrTransient` regardless of HTTP status (including success and 4xx), without
+including body contents in the error. Reading stops after at most 64 KiB + 1 byte;
+the body is closed without explicitly draining the rest.
+
+Provider error details (decoded JSON messages and Mailgun's raw-text fallback)
+are limited to 1 KiB of UTF-8 text, plus ` [truncated]` when shortened. Truncation
+preserves UTF-8 boundaries; invalid raw-text bytes are replaced.
+
+These fixed limits bound memory, not response time. Use a caller context deadline
+(or an appropriate custom HTTP client timeout) for slow or stalled responses;
+context cancellation still aborts HTTP response reads.
+
 ### SMTP security and migration
 
 SMTP has three explicit modes (`SMTPConfig.Mode`, factory `Config.SMTPMode`, or `SMTP_MODE`):
