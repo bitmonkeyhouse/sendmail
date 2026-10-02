@@ -40,9 +40,11 @@ type Config struct {
 	SMTPHost string
 	// SMTPPort is required when Provider is ProviderSMTP.
 	SMTPPort int
-	// SMTPUser is required when Provider is ProviderSMTP.
+	// SMTPMode selects SMTP security. The zero value requires STARTTLS.
+	SMTPMode SMTPMode
+	// SMTPUser is required except in credential-free dev-loopback mode.
 	SMTPUser string
-	// SMTPPassword is required when Provider is ProviderSMTP.
+	// SMTPPassword is required except in credential-free dev-loopback mode.
 	SMTPPassword string
 }
 
@@ -80,15 +82,11 @@ func NewSender(config Config) (Sender, error) {
 		return NewMailgunSenderWithConfig(config.MailgunAPIKey, config.MailgunDomain, config.DefaultFrom, MailgunConfig{Region: region}), nil
 
 	case ProviderSMTP:
-		if isBlank(config.SMTPHost) {
-			return nil, fmt.Errorf("smtp host is required")
+		mode := normalizeSMTPMode(config.SMTPMode)
+		if err := validateSMTPConfig(config.SMTPHost, config.SMTPPort, config.SMTPUser, config.SMTPPassword, mode); err != nil {
+			return nil, err
 		}
-		if config.SMTPPort < 1 || config.SMTPPort > 65535 {
-			return nil, fmt.Errorf("smtp port must be between 1 and 65535")
-		}
-		// Credentials optional: absent (e.g. Mailpit with AUTH disabled) -> nil
-		// auth in the sender; present -> PLAIN auth.
-		return NewSMTPSender(config.SMTPHost, config.SMTPPort, config.SMTPUser, config.SMTPPassword, config.DefaultFrom), nil
+		return NewSMTPSenderWithConfig(config.SMTPHost, config.SMTPPort, config.SMTPUser, config.SMTPPassword, config.DefaultFrom, SMTPConfig{Mode: mode}), nil
 	}
 
 	return nil, fmt.Errorf("unsupported email provider %q", config.Provider)
@@ -99,7 +97,8 @@ func NewSender(config Config) (Sender, error) {
 // EMAIL_PROVIDER must be one of resend, mailgun, or smtp. EMAIL_FROM configures
 // the default sender address. Provider-specific variables are RESEND_API_KEY;
 // MAILGUN_API_KEY, MAILGUN_DOMAIN, and optional MAILGUN_REGION; or SMTP_HOST,
-// SMTP_PORT, SMTP_USER, and SMTP_PASSWORD.
+// SMTP_PORT, SMTP_USER, SMTP_PASSWORD, and optional SMTP_MODE (starttls by default).
+// Only explicit dev-loopback mode may omit SMTP credentials.
 func NewSenderFromEnv() (Sender, error) {
 	config, err := configFromEnv()
 	if err != nil {
@@ -122,6 +121,7 @@ func configFromEnv() (Config, error) {
 		config.MailgunDomain = os.Getenv("MAILGUN_DOMAIN")
 		config.MailgunRegion = MailgunRegion(os.Getenv("MAILGUN_REGION"))
 	case ProviderSMTP:
+		config.SMTPMode = SMTPMode(os.Getenv("SMTP_MODE"))
 		config.SMTPHost = os.Getenv("SMTP_HOST")
 		config.SMTPUser = os.Getenv("SMTP_USER")
 		config.SMTPPassword = os.Getenv("SMTP_PASSWORD")
@@ -129,7 +129,7 @@ func configFromEnv() (Config, error) {
 		if port != "" {
 			parsedPort, err := strconv.Atoi(port)
 			if err != nil {
-				return Config{}, fmt.Errorf("SMTP_PORT must be an integer: %w", err)
+				return Config{}, fmt.Errorf("%w: SMTP_PORT must be an integer: %w", ErrPermanent, err)
 			}
 			config.SMTPPort = parsedPort
 		}

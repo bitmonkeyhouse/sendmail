@@ -15,6 +15,24 @@ import (
 	"time"
 )
 
+// SMTPMode selects the SMTP transport security policy.
+type SMTPMode string
+
+const (
+	// SMTPModeSTARTTLS requires verified STARTTLS before authentication or delivery.
+	SMTPModeSTARTTLS SMTPMode = "starttls"
+	// SMTPModeTLS establishes verified implicit TLS before the SMTP greeting.
+	SMTPModeTLS SMTPMode = "tls"
+	// SMTPModeDevLoopback permits unauthenticated plaintext only to a loopback TCP peer.
+	SMTPModeDevLoopback SMTPMode = "dev-loopback"
+)
+
+// SMTPConfig configures an SMTPSender.
+type SMTPConfig struct {
+	// Mode selects the security policy. The zero value requires STARTTLS.
+	Mode SMTPMode
+}
+
 // SMTPSender delivers email via a standard SMTP server.
 type SMTPSender struct {
 	host     string
@@ -22,24 +40,34 @@ type SMTPSender struct {
 	user     string
 	password string
 	from     string
+	mode     SMTPMode
 }
 
-// NewSMTPSender creates a Sender that uses SMTP with PLAIN auth.
-// host is the SMTP server hostname, port is the port number,
-// user/password are the SMTP credentials, and from is the default sender address.
-// When credentials are configured, the server must advertise AUTH.
+// NewSMTPSender creates an SMTP sender requiring verified STARTTLS and PLAIN auth.
+// host is the certificate hostname, port is the port number, user/password are
+// required credentials, and from is the default sender address.
+// Configuration is validated by Send before dialing.
 func NewSMTPSender(host string, port int, user, password, from string) *SMTPSender {
+	return NewSMTPSenderWithConfig(host, port, user, password, from, SMTPConfig{})
+}
+
+// NewSMTPSenderWithConfig is like NewSMTPSender but selects an explicit security
+// mode. Only dev-loopback may omit credentials; configured credentials require
+// TLS and advertised AUTH in every mode. Send validates configuration before dialing.
+func NewSMTPSenderWithConfig(host string, port int, user, password, from string, config SMTPConfig) *SMTPSender {
 	return &SMTPSender{
 		host:     host,
 		port:     port,
 		user:     user,
 		password: password,
 		from:     from,
+		mode:     normalizeSMTPMode(config.Mode),
 	}
 }
 
-// Send rejects line breaks in headers and invalid mailbox addresses with ErrPermanent.
-// Delivery is limited to 30 seconds, or the caller's earlier deadline.
+// Send validates SMTP configuration and message headers before dialing.
+// Invalid configuration, headers, certificates, and security-policy violations
+// wrap ErrPermanent. Delivery is limited to 30 seconds, or the caller's earlier deadline.
 func (s *SMTPSender) Send(ctx context.Context, msg Message) error {
 	return s.send(ctx, msg, 30*time.Second, nil)
 }
@@ -61,10 +89,11 @@ func (s *SMTPSender) send(ctx context.Context, msg Message, timeout time.Duratio
 		return err
 	}
 
+	mode := normalizeSMTPMode(s.mode)
+	if err := validateSMTPConfig(s.host, s.port, s.user, s.password, mode); err != nil {
+		return err
+	}
 	addr := net.JoinHostPort(s.host, fmt.Sprint(s.port))
-	// Auth only when credentials are configured. Local dev servers (Mailpit)
-	// run AUTH-disabled and reject a PLAIN auth attempt with "server doesn't
-	// support AUTH"; nil auth skips the AUTH step entirely.
 	var auth smtp.Auth
 	if s.user != "" || s.password != "" {
 		auth = smtp.PlainAuth("", s.user, s.password, s.host)
@@ -93,6 +122,9 @@ func (s *SMTPSender) send(ctx context.Context, msg Message, timeout time.Duratio
 		if sendErr == nil {
 			return
 		}
+		if errors.Is(sendErr, ErrPermanent) || errors.Is(sendErr, ErrTransient) {
+			return
+		}
 		if err := ctx.Err(); err != nil {
 			sendErr = fmt.Errorf("%w: %w", ErrTransient, err)
 			return
@@ -117,26 +149,48 @@ func (s *SMTPSender) send(ctx context.Context, msg Message, timeout time.Duratio
 	if err := conn.SetDeadline(deadline); err != nil {
 		return err
 	}
-	// NewClient reads the greeting, so both cancellation and the deadline
-	// must already apply to the raw connection (also used beneath TLS).
-	client, err := smtp.NewClient(conn, s.host)
+	if mode == SMTPModeDevLoopback {
+		if err := validateSMTPLoopbackPeer(conn.RemoteAddr()); err != nil {
+			return err
+		}
+	}
+	if tlsConfig == nil {
+		tlsConfig = &tls.Config{}
+	} else {
+		// The private test config can trust a fixture, but hostname verification
+		// always uses the configured SMTP host.
+		tlsConfig = tlsConfig.Clone()
+	}
+	tlsConfig.ServerName = s.host
+	// Attach cancellation and deadline to the raw socket before either the TLS
+	// handshake or NewClient's greeting read. Keep ownership of that raw socket.
+	smtpConn := conn
+	if mode == SMTPModeTLS {
+		secure := tls.Client(conn, tlsConfig)
+		if err := secure.HandshakeContext(ctx); err != nil {
+			return err
+		}
+		smtpConn = secure
+	}
+	client, err := smtp.NewClient(smtpConn, s.host)
 	if err != nil {
 		return err
 	}
 	if err := client.Hello("localhost"); err != nil {
 		return err
 	}
-	if ok, _ := client.Extension("STARTTLS"); ok {
-		if tlsConfig == nil {
-			tlsConfig = &tls.Config{ServerName: s.host}
-		}
-		if err := client.StartTLS(tlsConfig); err != nil {
-			return err
+	if mode != SMTPModeTLS {
+		if ok, _ := client.Extension("STARTTLS"); ok {
+			if err := client.StartTLS(tlsConfig); err != nil {
+				return err
+			}
+		} else if mode == SMTPModeSTARTTLS || auth != nil {
+			return fmt.Errorf("%w: smtp: server doesn't support required STARTTLS", ErrPermanent)
 		}
 	}
 	if auth != nil {
 		if ok, _ := client.Extension("AUTH"); !ok {
-			return errors.New("smtp: server doesn't support AUTH")
+			return fmt.Errorf("%w: smtp: server doesn't support AUTH after TLS", ErrPermanent)
 		}
 		if err := client.Auth(auth); err != nil {
 			return err
@@ -207,6 +261,16 @@ func classifySMTPError(err error) error {
 	if err == nil {
 		return nil
 	}
+	if errors.Is(err, ErrPermanent) || errors.Is(err, ErrTransient) {
+		return err
+	}
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return fmt.Errorf("%w: SMTP certificate verification: %w", ErrPermanent, err)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %w", ErrTransient, err)
+	}
 	var tpErr *textproto.Error
 	if errors.As(err, &tpErr) {
 		if tpErr.Code >= 500 {
@@ -214,6 +278,42 @@ func classifySMTPError(err error) error {
 		}
 	}
 	return fmt.Errorf("%w: %v", ErrTransient, err)
+}
+
+func normalizeSMTPMode(mode SMTPMode) SMTPMode {
+	mode = SMTPMode(strings.ToLower(strings.TrimSpace(string(mode))))
+	if mode == "" {
+		return SMTPModeSTARTTLS
+	}
+	return mode
+}
+
+func validateSMTPConfig(host string, port int, user, password string, mode SMTPMode) error {
+	switch mode {
+	case SMTPModeSTARTTLS, SMTPModeTLS, SMTPModeDevLoopback:
+	default:
+		return fmt.Errorf("%w: unsupported smtp mode %q", ErrPermanent, mode)
+	}
+	if isBlank(host) {
+		return fmt.Errorf("%w: smtp host is required", ErrPermanent)
+	}
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("%w: smtp port must be between 1 and 65535", ErrPermanent)
+	}
+	if mode != SMTPModeDevLoopback || user != "" || password != "" {
+		if isBlank(user) || isBlank(password) {
+			return fmt.Errorf("%w: smtp user and password are required", ErrPermanent)
+		}
+	}
+	return nil
+}
+
+func validateSMTPLoopbackPeer(addr net.Addr) error {
+	peer, ok := addr.(*net.TCPAddr)
+	if !ok || !peer.IP.IsLoopback() {
+		return fmt.Errorf("%w: smtp dev-loopback requires a loopback TCP peer", ErrPermanent)
+	}
+	return nil
 }
 
 func randomBoundary() (string, error) {

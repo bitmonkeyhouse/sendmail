@@ -30,25 +30,11 @@ type fakeSMTPMessage struct {
 // It returns the port and a channel that will receive the first message processed.
 func startFakeSMTP(t *testing.T) (int, <-chan fakeSMTPMessage) {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
 	ch := make(chan fakeSMTPMessage, 1)
-
-	go func() {
-		defer func() { _ = ln.Close() }()
-		conn, err := ln.Accept()
-		if err != nil {
-			close(ch)
-			return
-		}
-		defer func() { _ = conn.Close() }()
-		msg := handleSMTPConn(conn)
-		ch <- msg
-	}()
-
+	port, _ := startSMTPPeer(t, func(conn net.Conn) error {
+		ch <- handleSMTPConn(conn)
+		return nil
+	})
 	return port, ch
 }
 
@@ -110,7 +96,7 @@ func extractAngleAddr(s string) string {
 
 func TestSMTPSender_DefaultFrom(t *testing.T) {
 	port, msgCh := startFakeSMTP(t)
-	sender := NewSMTPSender("127.0.0.1", port, "user", "pass", "noreply@example.com")
+	sender := NewSMTPSenderWithConfig("127.0.0.1", port, "", "", "noreply@example.com", SMTPConfig{Mode: SMTPModeDevLoopback})
 
 	msg := Message{
 		To:       "user@example.com",
@@ -154,7 +140,7 @@ func TestSMTPSender_DefaultFrom(t *testing.T) {
 
 func TestSMTPSender_ExplicitFrom(t *testing.T) {
 	port, msgCh := startFakeSMTP(t)
-	sender := NewSMTPSender("127.0.0.1", port, "user", "pass", "noreply@example.com")
+	sender := NewSMTPSenderWithConfig("127.0.0.1", port, "", "", "noreply@example.com", SMTPConfig{Mode: SMTPModeDevLoopback})
 
 	msg := Message{
 		To:       "user@example.com",
@@ -219,9 +205,9 @@ func TestSMTPSender_InvalidHeaders(t *testing.T) {
 				case "DefaultFrom":
 					defaultFrom = tc.value
 				}
-				// Port zero refuses connections, so reaching the network would
-				// yield ErrTransient instead of the required validation error.
-				sender := NewSMTPSender("127.0.0.1", 0, "", "", defaultFrom)
+				// Port zero prevents connections if header validation regresses;
+				// the error below must identify the header, not SMTP configuration.
+				sender := NewSMTPSenderWithConfig("127.0.0.1", 0, "", "", defaultFrom, SMTPConfig{Mode: SMTPModeDevLoopback})
 				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 				defer cancel()
 				err := sender.Send(ctx, msg)
@@ -258,7 +244,7 @@ func TestSMTPSender_EncodedHeaders(t *testing.T) {
 					msg.From = from
 					defaultFrom = "invalid\r\ndefault"
 				}
-				sender := NewSMTPSender("127.0.0.1", port, "", "", defaultFrom)
+				sender := NewSMTPSenderWithConfig("127.0.0.1", port, "", "", defaultFrom, SMTPConfig{Mode: SMTPModeDevLoopback})
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
 				if err := sender.Send(ctx, msg); err != nil {
@@ -376,6 +362,11 @@ func startSMTPPeer(t *testing.T, serve func(net.Conn) error) (int, <-chan error)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return startSMTPPeerListener(t, ln, serve)
+}
+
+func startSMTPPeerListener(t *testing.T, ln net.Listener, serve func(net.Conn) error) (int, <-chan error) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	exited := make(chan struct{})
@@ -407,7 +398,7 @@ func startSMTPPeer(t *testing.T, serve func(net.Conn) error) (int, <-chan error)
 	return ln.Addr().(*net.TCPAddr).Port, result
 }
 
-func TestSMTPSender_AuthAdvertisement(t *testing.T) {
+func TestSMTPSender_DevHelloFallback(t *testing.T) {
 	for _, tc := range []struct {
 		helo        bool
 		credentials bool
@@ -459,13 +450,13 @@ func TestSMTPSender_AuthAdvertisement(t *testing.T) {
 			if tc.credentials {
 				user, password = "user", "pass"
 			}
-			sender := NewSMTPSender("127.0.0.1", port, user, password, "from@example.com")
+			sender := NewSMTPSenderWithConfig("127.0.0.1", port, user, password, "from@example.com", SMTPConfig{Mode: SMTPModeDevLoopback})
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 			err := sender.Send(ctx, Message{To: "to@example.com"})
 			if tc.credentials {
-				if !errors.Is(err, ErrTransient) || !strings.Contains(err.Error(), "server doesn't support AUTH") {
-					t.Fatalf("expected missing AUTH error, got %v", err)
+				if !errors.Is(err, ErrPermanent) || !strings.Contains(err.Error(), "required STARTTLS") {
+					t.Fatalf("expected missing STARTTLS error, got %v", err)
 				}
 			} else if err != nil {
 				t.Fatal(err)
@@ -513,7 +504,7 @@ func TestSMTPSender_STARTTLSVerifiesCertificate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	err := sender.Send(ctx, Message{To: "to@example.com"})
-	if !errors.Is(err, ErrTransient) || !strings.Contains(err.Error(), "certificate") {
+	if !errors.Is(err, ErrPermanent) || !strings.Contains(err.Error(), "certificate") {
 		t.Fatalf("expected certificate verification failure, got %v", err)
 	}
 	select {
@@ -526,85 +517,96 @@ func TestSMTPSender_STARTTLSVerifiesCertificate(t *testing.T) {
 	}
 }
 
-func TestSMTPSender_STARTTLSDelivery(t *testing.T) {
-	fixture := httptest.NewTLSServer(nil)
-	defer fixture.Close()
-	// Trust only this fixture, with normal certificate and IP verification.
-	roots := x509.NewCertPool()
-	roots.AddCert(fixture.Certificate())
-	const host = "127.0.0.1"
-	tlsConfig := &tls.Config{ServerName: host, RootCAs: roots}
-	msg := Message{
-		To:       "Recipient <to@example.com>",
-		Subject:  "TLS delivery",
-		TextBody: "Delivered after STARTTLS",
-		HTMLBody: "<p>Delivered after STARTTLS</p>",
-	}
-	port, peerResult := startSMTPPeer(t, func(conn net.Conn) error {
-		peer := textproto.NewConn(conn)
-		exchange := func(command, reply string) error {
-			line, err := peer.ReadLine()
-			if err != nil || line != command {
-				return fmt.Errorf("expected %s, got %q: %v", command, line, err)
+func TestSMTPSender_TLSDelivery(t *testing.T) {
+	for _, mode := range []SMTPMode{SMTPModeSTARTTLS, SMTPModeTLS} {
+		t.Run(string(mode), func(t *testing.T) {
+			fixture := httptest.NewTLSServer(nil)
+			defer fixture.Close()
+			// Trust only this fixture, with normal certificate and IP verification.
+			roots := x509.NewCertPool()
+			roots.AddCert(fixture.Certificate())
+			const host = "127.0.0.1"
+			tlsConfig := &tls.Config{ServerName: host, RootCAs: roots}
+			msg := Message{
+				To:       "Recipient <to@example.com>",
+				Subject:  "TLS delivery",
+				TextBody: "Delivered over verified TLS",
+				HTMLBody: "<p>Delivered over verified TLS</p>",
 			}
-			return peer.PrintfLine("%s", reply)
-		}
-		if err := peer.PrintfLine("220 ready"); err != nil {
-			return err
-		}
-		if err := exchange("EHLO localhost", "250-peer\r\n250 STARTTLS"); err != nil {
-			return err
-		}
-		if err := exchange("STARTTLS", "220 start TLS"); err != nil {
-			return err
-		}
-		secure := tls.Server(conn, fixture.TLS)
-		if err := secure.Handshake(); err != nil {
-			return err
-		}
-		// Every subsequent command is read from the encrypted connection.
-		peer = textproto.NewConn(secure)
-		if err := exchange("EHLO localhost", "250-peer\r\n250 AUTH PLAIN"); err != nil {
-			return err
-		}
-		credentials := base64.StdEncoding.EncodeToString([]byte("\x00user\x00pass"))
-		for _, step := range []struct{ command, reply string }{
-			{"AUTH PLAIN " + credentials, "235 authenticated"},
-			{"MAIL FROM:<from@example.com>", "250 OK"},
-			{"RCPT TO:<to@example.com>", "250 OK"},
-			{"DATA", "354 send data"},
-		} {
-			if err := exchange(step.command, step.reply); err != nil {
-				return err
+			port, peerResult := startSMTPPeer(t, func(conn net.Conn) error {
+				peer := textproto.NewConn(conn)
+				exchange := func(command, reply string) error {
+					line, err := peer.ReadLine()
+					if err != nil || line != command {
+						return fmt.Errorf("expected %s, got %q: %v", command, line, err)
+					}
+					return peer.PrintfLine("%s", reply)
+				}
+				if mode == SMTPModeSTARTTLS {
+					if err := peer.PrintfLine("220 ready"); err != nil {
+						return err
+					}
+					if err := exchange("EHLO localhost", "250-peer\r\n250 STARTTLS"); err != nil {
+						return err
+					}
+					if err := exchange("STARTTLS", "220 start TLS"); err != nil {
+						return err
+					}
+				}
+				secure := tls.Server(conn, fixture.TLS)
+				if err := secure.Handshake(); err != nil {
+					return err
+				}
+				// Every subsequent command is read from the encrypted connection.
+				peer = textproto.NewConn(secure)
+				if mode == SMTPModeTLS {
+					if err := peer.PrintfLine("220 ready"); err != nil {
+						return err
+					}
+				}
+				if err := exchange("EHLO localhost", "250-peer\r\n250 AUTH PLAIN"); err != nil {
+					return err
+				}
+				credentials := base64.StdEncoding.EncodeToString([]byte("\x00user\x00pass"))
+				for _, step := range []struct{ command, reply string }{
+					{"AUTH PLAIN " + credentials, "235 authenticated"},
+					{"MAIL FROM:<from@example.com>", "250 OK"},
+					{"RCPT TO:<to@example.com>", "250 OK"},
+					{"DATA", "354 send data"},
+				} {
+					if err := exchange(step.command, step.reply); err != nil {
+						return err
+					}
+				}
+				body, err := peer.ReadDotBytes()
+				if err != nil {
+					return err
+				}
+				for _, want := range []string{"Subject: " + msg.Subject, msg.TextBody, msg.HTMLBody} {
+					if !strings.Contains(string(body), want) {
+						return fmt.Errorf("delivered message missing %q", want)
+					}
+				}
+				if err := peer.PrintfLine("250 accepted"); err != nil {
+					return err
+				}
+				return exchange("QUIT", "221 bye")
+			})
+			sender := NewSMTPSenderWithConfig(host, port, "user", "pass", "Sender <from@example.com>", SMTPConfig{Mode: mode})
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := sender.send(ctx, msg, 30*time.Second, tlsConfig); err != nil {
+				t.Fatalf("Send with verified %s: %v", mode, err)
 			}
-		}
-		body, err := peer.ReadDotBytes()
-		if err != nil {
-			return err
-		}
-		for _, want := range []string{"Subject: " + msg.Subject, msg.TextBody, msg.HTMLBody} {
-			if !strings.Contains(string(body), want) {
-				return fmt.Errorf("delivered message missing %q", want)
+			select {
+			case err := <-peerResult:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-ctx.Done():
+				t.Fatal("TLS peer did not finish")
 			}
-		}
-		if err := peer.PrintfLine("250 accepted"); err != nil {
-			return err
-		}
-		return exchange("QUIT", "221 bye")
-	})
-	sender := NewSMTPSender(host, port, "user", "pass", "Sender <from@example.com>")
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := sender.send(ctx, msg, 30*time.Second, tlsConfig); err != nil {
-		t.Fatalf("Send with verified STARTTLS: %v", err)
-	}
-	select {
-	case err := <-peerResult:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-ctx.Done():
-		t.Fatal("TLS peer did not finish")
+		})
 	}
 }
 
@@ -636,7 +638,7 @@ func TestSMTPSender_AlreadyCanceled(t *testing.T) {
 }
 
 func TestSMTPSender_StallsCloseConnection(t *testing.T) {
-	for _, stage := range []string{"greeting", "mail", "data", "tls"} {
+	for _, stage := range []string{"greeting", "mail", "data", "tls", "implicit_tls"} {
 		for _, mode := range []string{"cancel", "caller_deadline", "fallback_deadline"} {
 			t.Run(stage+"/"+mode, func(t *testing.T) {
 				ready := make(chan struct{})
@@ -655,7 +657,7 @@ func TestSMTPSender_StallsCloseConnection(t *testing.T) {
 						}
 						return nil
 					}
-					if stage != "greeting" {
+					if stage != "greeting" && stage != "implicit_tls" {
 						if err := step("220 ready\r\n", "EHLO "); err != nil {
 							return err
 						}
@@ -704,7 +706,10 @@ func TestSMTPSender_StallsCloseConnection(t *testing.T) {
 					ctx, deadlineCancel = context.WithTimeout(ctx, time.Second)
 					defer deadlineCancel()
 				}
-				sender := NewSMTPSender("127.0.0.1", port, "", "", "from@example.com")
+				sender := NewSMTPSenderWithConfig("127.0.0.1", port, "", "", "from@example.com", SMTPConfig{Mode: SMTPModeDevLoopback})
+				if stage == "implicit_tls" {
+					sender = NewSMTPSenderWithConfig("127.0.0.1", port, "user", "pass", "from@example.com", SMTPConfig{Mode: SMTPModeTLS})
+				}
 				result := make(chan error, 1)
 				go func() {
 					msg := Message{To: "to@example.com", TextBody: "hello"}

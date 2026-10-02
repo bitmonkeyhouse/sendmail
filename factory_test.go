@@ -1,6 +1,7 @@
 package sendmail
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -177,8 +178,6 @@ func TestNewSender_Validation(t *testing.T) {
 			},
 			wantErr: "smtp port must be between 1 and 65535",
 		},
-		// SMTP credentials are now optional (nil auth when absent, e.g. Mailpit),
-		// so the former "missing smtp user/password" error cases are removed.
 	}
 
 	for _, tt := range tests {
@@ -238,6 +237,7 @@ func TestNewSenderFromEnv_ConfiguresMailgun(t *testing.T) {
 }
 
 func TestNewSenderFromEnv_ConfiguresSMTP(t *testing.T) {
+	t.Setenv("SMTP_MODE", "")
 	t.Setenv("EMAIL_PROVIDER", "smtp")
 	t.Setenv("EMAIL_FROM", "default@example.com")
 	t.Setenv("SMTP_HOST", "smtp.example.com")
@@ -273,5 +273,58 @@ func TestNewSenderFromEnv_InvalidSMTPPort(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "SMTP_PORT must be an integer") {
 		t.Fatalf("expected SMTP_PORT error, got %q", err.Error())
+	}
+}
+
+func TestSMTPFactoryModes(t *testing.T) {
+	for _, tc := range []struct {
+		mode           SMTPMode
+		user, password string
+		want           SMTPMode
+		invalid        bool
+	}{
+		{"", "user", "pass", SMTPModeSTARTTLS, false},
+		{SMTPModeSTARTTLS, "user", "pass", SMTPModeSTARTTLS, false},
+		{" TLS ", "user", "pass", SMTPModeTLS, false},
+		{SMTPModeDevLoopback, "", "", SMTPModeDevLoopback, false},
+		{SMTPModeDevLoopback, "user", "pass", SMTPModeDevLoopback, false},
+		{"typo", "user", "pass", "", true},
+		{"dev_loopback", "", "", "", true},
+		{"", "", "", "", true},
+		{SMTPModeSTARTTLS, "", "pass", "", true},
+		{SMTPModeTLS, "user", "", "", true},
+		{SMTPModeDevLoopback, "user", "", "", true},
+	} {
+		t.Run(string(tc.mode)+"/"+tc.user+"/"+tc.password, func(t *testing.T) {
+			config := Config{Provider: ProviderSMTP, DefaultFrom: "from@example.com", SMTPHost: "127.0.0.1", SMTPPort: 587, SMTPMode: tc.mode, SMTPUser: tc.user, SMTPPassword: tc.password}
+			t.Setenv("EMAIL_PROVIDER", "smtp")
+			t.Setenv("EMAIL_FROM", config.DefaultFrom)
+			t.Setenv("SMTP_HOST", config.SMTPHost)
+			t.Setenv("SMTP_PORT", "587")
+			t.Setenv("SMTP_MODE", string(tc.mode))
+			t.Setenv("SMTP_USER", tc.user)
+			t.Setenv("SMTP_PASSWORD", tc.password)
+			for _, source := range []string{"config", "env"} {
+				var sender Sender
+				var err error
+				if source == "config" {
+					sender, err = NewSender(config)
+				} else {
+					sender, err = NewSenderFromEnv()
+				}
+				if tc.invalid {
+					if sender != nil || !errors.Is(err, ErrPermanent) {
+						t.Fatalf("%s: expected permanent validation failure, got %T: %v", source, sender, err)
+					}
+				} else {
+					if err != nil {
+						t.Fatalf("%s: %v", source, err)
+					}
+					if got := sender.(*SMTPSender).mode; got != tc.want {
+						t.Fatalf("%s: mode=%q, want %q", source, got, tc.want)
+					}
+				}
+			}
+		})
 	}
 }

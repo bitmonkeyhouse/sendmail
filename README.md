@@ -36,10 +36,32 @@ Use the high-level factory methods when you want this package to choose the prov
 | `sendmail.NewMailgunSender(apiKey, domain, defaultFrom)` | Creates a Mailgun HTTP sender directly, using the EU endpoint by default. |
 | `sendmail.NewMailgunSenderWithConfig(apiKey, domain, defaultFrom, config)` | Creates a Mailgun sender with Mailgun-specific config, such as `MailgunRegionUS`. |
 | `sendmail.NewMailgunSenderWithClient(apiKey, domain, defaultFrom, client)` | Creates a Mailgun sender with a custom `http.Client`, mainly for tests. |
-| `sendmail.NewSMTPSender(host, port, user, password, defaultFrom)` | Creates an SMTP sender using PLAIN auth. |
+| `sendmail.NewSMTPSender(host, port, user, password, defaultFrom)` | Creates an SMTP sender requiring verified STARTTLS and PLAIN auth. |
+| `sendmail.NewSMTPSenderWithConfig(host, port, user, password, defaultFrom, config)` | Selects SMTP security with `SMTPConfig{Mode: ...}`. |
 | `sendmail.NewMockSender()` | Creates an in-memory test double that records sent messages. |
 
 Mailgun defaults to the EU API endpoint. Use `sendmail.MailgunRegionUS` in `sendmail.MailgunConfig` for US domains.
+
+### SMTP security and migration
+
+SMTP has three explicit modes (`SMTPConfig.Mode`, factory `Config.SMTPMode`, or `SMTP_MODE`):
+
+- `starttls` (`SMTPModeSTARTTLS`, also the zero/unset default): requires advertised STARTTLS, a certificate verified against system roots and the server hostname, then successful PLAIN authentication before MAIL/DATA. An EHLO-to-HELO fallback does not bypass this requirement.
+- `tls` (`SMTPModeTLS`): establishes verified implicit TLS **before** the SMTP greeting, then requires authentication. Commonly used on port 465; the mode does not depend on the port.
+- `dev-loopback` (`SMTPModeDevLoopback`): explicitly permits credential-free plaintext only when the **actual connected TCP peer IP** is loopback (IPv4 or IPv6). A hostname named `localhost` is not sufficient; private LAN and container IPs are not exempt. STARTTLS, if advertised, is still verified. If credentials are configured, TLS and advertised AUTH are required and authentication cannot be skipped.
+
+Both production modes require a nonblank username and password. Unknown modes and incomplete credentials fail closed with `ErrPermanent`; certificate verification and security-policy failures are also permanent. Mode values are case-insensitive and trimmed, but typos are rejected. Network failures, timeouts, and cancellation remain transient (with context sentinels preserved). Sends retain the 30-second maximum deadline or the caller's earlier deadline.
+
+**Migration:** existing `NewSMTPSender` calls now require STARTTLS and credentials, even for loopback. Remote unauthenticated relays are no longer supported. For Mailpit, explicitly opt into development mode and connect through a host-loopback published port, not its private/container address:
+
+```go
+sender := sendmail.NewSMTPSenderWithConfig(
+    "127.0.0.1", 1025, "", "", "App <noreply@example.com>",
+    sendmail.SMTPConfig{Mode: sendmail.SMTPModeDevLoopback},
+)
+```
+
+The equivalent environment configuration uses `SMTP_MODE=dev-loopback`, `SMTP_HOST=127.0.0.1`, `SMTP_PORT=1025`, and unset `SMTP_USER`/`SMTP_PASSWORD`. A container connecting to Mailpit on another container's IP cannot use this exception. Direct constructors retain their signatures and validate in `Send` before dialing; the factory validates configuration immediately. There is no public TLS verification bypass.
 
 ### Config-based provider selection
 
@@ -91,8 +113,9 @@ Explicit constructors do not read environment variables; callers pass those valu
 | `MAILGUN_REGION` | Mailgun | No | Mailgun API region: `eu` or `us`. Defaults to `eu` when unset. |
 | `SMTP_HOST` | SMTP | Yes for `EMAIL_PROVIDER=smtp` | SMTP server hostname. |
 | `SMTP_PORT` | SMTP | Yes for `EMAIL_PROVIDER=smtp` | SMTP server port, for example `587`. Must be an integer from 1 to 65535. |
-| `SMTP_USER` | SMTP | Yes for `EMAIL_PROVIDER=smtp` | SMTP username for PLAIN auth. |
-| `SMTP_PASSWORD` | SMTP | Yes for `EMAIL_PROVIDER=smtp` | SMTP password for PLAIN auth. |
+| `SMTP_MODE` | SMTP | No | `starttls` (default), `tls`, or explicit `dev-loopback`. |
+| `SMTP_USER` | SMTP | Except credential-free `dev-loopback` | SMTP username for PLAIN auth after TLS. |
+| `SMTP_PASSWORD` | SMTP | Except credential-free `dev-loopback` | SMTP password for PLAIN auth after TLS. |
 | `RESEND_TO_ADDRESS` | Resend integration test only | Yes for `TestResendSender_Integration` | Recipient address for the opt-in live Resend integration test. It is not used by runtime sender configuration. |
 
 All senders implement:
