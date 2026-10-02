@@ -3,13 +3,16 @@ package sendmail
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"mime"
+	"net"
 	"net/mail"
 	"net/smtp"
 	"net/textproto"
 	"strings"
+	"time"
 )
 
 // SMTPSender delivers email via a standard SMTP server.
@@ -24,6 +27,7 @@ type SMTPSender struct {
 // NewSMTPSender creates a Sender that uses SMTP with PLAIN auth.
 // host is the SMTP server hostname, port is the port number,
 // user/password are the SMTP credentials, and from is the default sender address.
+// When credentials are configured, the server must advertise AUTH.
 func NewSMTPSender(host string, port int, user, password, from string) *SMTPSender {
 	return &SMTPSender{
 		host:     host,
@@ -35,7 +39,18 @@ func NewSMTPSender(host string, port int, user, password, from string) *SMTPSend
 }
 
 // Send rejects line breaks in headers and invalid mailbox addresses with ErrPermanent.
+// Delivery is limited to 30 seconds, or the caller's earlier deadline.
 func (s *SMTPSender) Send(ctx context.Context, msg Message) error {
+	return s.send(ctx, msg, 30*time.Second, nil)
+}
+
+// A nil TLS config uses hostname verification and the system certificate roots.
+func (s *SMTPSender) send(ctx context.Context, msg Message, timeout time.Duration, tlsConfig *tls.Config) (sendErr error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: %w", ErrTransient, err)
+	}
 	from := msg.From
 	if from == "" {
 		from = s.from
@@ -46,7 +61,7 @@ func (s *SMTPSender) Send(ctx context.Context, msg Message) error {
 		return err
 	}
 
-	addr := fmt.Sprintf("%s:%d", s.host, s.port)
+	addr := net.JoinHostPort(s.host, fmt.Sprint(s.port))
 	// Auth only when credentials are configured. Local dev servers (Mailpit)
 	// run AUTH-disabled and reject a PLAIN auth attempt with "server doesn't
 	// support AUTH"; nil auth skips the AUTH step entirely.
@@ -72,17 +87,78 @@ func (s *SMTPSender) Send(ctx context.Context, msg Message) error {
 	b.WriteString(msg.HTMLBody + "\r\n")
 	fmt.Fprintf(&b, "--%s--\r\n", boundary)
 
-	done := make(chan error, 1)
-	go func() {
-		done <- smtp.SendMail(addr, auth, from, []string{to}, []byte(b.String()))
+	// Only translate failed operations: cancellation racing with a successful
+	// QUIT must not turn a completed send into a retryable failure.
+	defer func() {
+		if sendErr == nil {
+			return
+		}
+		if err := ctx.Err(); err != nil {
+			sendErr = fmt.Errorf("%w: %w", ErrTransient, err)
+			return
+		}
+		var netErr net.Error
+		if errors.As(sendErr, &netErr) && netErr.Timeout() {
+			// The socket deadline can fire before the context timer runs.
+			sendErr = fmt.Errorf("%w: %w: %v", ErrTransient, context.DeadlineExceeded, sendErr)
+			return
+		}
+		sendErr = classifySMTPError(sendErr)
 	}()
 
-	select {
-	case <-ctx.Done():
-		return fmt.Errorf("%w: %v", ErrTransient, ctx.Err())
-	case err := <-done:
-		return classifySMTPError(err)
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return err
 	}
+	defer func() { _ = conn.Close() }()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	deadline, _ := ctx.Deadline()
+	if err := conn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	// NewClient reads the greeting, so both cancellation and the deadline
+	// must already apply to the raw connection (also used beneath TLS).
+	client, err := smtp.NewClient(conn, s.host)
+	if err != nil {
+		return err
+	}
+	if err := client.Hello("localhost"); err != nil {
+		return err
+	}
+	if ok, _ := client.Extension("STARTTLS"); ok {
+		if tlsConfig == nil {
+			tlsConfig = &tls.Config{ServerName: s.host}
+		}
+		if err := client.StartTLS(tlsConfig); err != nil {
+			return err
+		}
+	}
+	if auth != nil {
+		if ok, _ := client.Extension("AUTH"); !ok {
+			return errors.New("smtp: server doesn't support AUTH")
+		}
+		if err := client.Auth(auth); err != nil {
+			return err
+		}
+	}
+	if err := client.Mail(from); err != nil {
+		return err
+	}
+	if err := client.Rcpt(to); err != nil {
+		return err
+	}
+	writer, err := client.Data()
+	if err != nil {
+		return err
+	}
+	if _, err := writer.Write([]byte(b.String())); err != nil {
+		return err
+	}
+	if err := writer.Close(); err != nil {
+		return err
+	}
+	return client.Quit()
 }
 
 // prepareSMTPHeaders returns serialized headers and bare SMTP envelope addresses.
