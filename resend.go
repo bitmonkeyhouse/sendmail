@@ -17,8 +17,10 @@ type ResendSender struct {
 	client      *http.Client
 }
 
-// NewResendSender creates a Sender that uses the Resend API.
-// apiKey is the Resend API key; defaultFrom is used when msg.From is empty.
+// NewResendSender creates a ResendSender that uses the Resend API.
+// apiKey is the Resend API key and defaultFrom is used when msg.From is empty.
+// It does not validate apiKey and uses an http.Client with no timeout, so callers
+// should pass a context with a deadline to Send.
 func NewResendSender(apiKey, defaultFrom string) *ResendSender {
 	return &ResendSender{
 		apiKey:      apiKey,
@@ -28,8 +30,10 @@ func NewResendSender(apiKey, defaultFrom string) *ResendSender {
 	}
 }
 
-// NewResendSenderWithClient is like NewResendSender but accepts a custom
-// http.Client (useful for testing with a stubbed transport).
+// NewResendSenderWithClient is like NewResendSender but uses client for HTTP
+// requests, which is useful for testing with a stubbed transport. client must be
+// non-nil and is used as-is; a client without its own Timeout relies on the
+// context passed to Send for deadlines.
 func NewResendSenderWithClient(apiKey, defaultFrom string, client *http.Client) *ResendSender {
 	return &ResendSender{
 		apiKey:      apiKey,
@@ -52,6 +56,15 @@ type resendErrorResp struct {
 	Message string `json:"message"`
 }
 
+// Send delivers msg through the Resend API. If msg.From is empty, the sender's
+// defaultFrom is used.
+//
+// It returns an error wrapping ErrTransient for transport failures, 5xx
+// responses, rate limiting (HTTP 429), and response-read failures (including
+// oversized bodies), and one wrapping ErrPermanent for other 4xx responses and
+// request-construction failures.
+// Cancelling ctx aborts the request; the resulting transport error is wrapped
+// as ErrTransient but does not necessarily wrap ctx.Err().
 func (s *ResendSender) Send(ctx context.Context, msg Message) error {
 	from := msg.From
 	if from == "" {

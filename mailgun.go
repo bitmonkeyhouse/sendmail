@@ -28,7 +28,8 @@ const (
 
 // MailgunConfig configures a MailgunSender.
 type MailgunConfig struct {
-	// Region chooses the Mailgun API endpoint. The zero value defaults to EU.
+	// Region chooses the Mailgun API endpoint. The zero value uses EU.
+	// Direct constructors also use EU for unrecognized values; NewSender rejects them.
 	Region MailgunRegion
 }
 
@@ -41,21 +42,27 @@ type MailgunSender struct {
 	client      *http.Client
 }
 
-// NewMailgunSender creates a Sender that uses the Mailgun API.
-// apiKey is the Mailgun API key, domain is the sending domain, and
-// defaultFrom is used when msg.From is empty. It defaults to Mailgun's EU endpoint.
+// NewMailgunSender creates a MailgunSender that uses the Mailgun API.
+// apiKey is the Mailgun API key, domain is the sending domain, and defaultFrom
+// is used when msg.From is empty. It defaults to Mailgun's EU endpoint and uses
+// an http.Client with no timeout, so callers should pass a context with a
+// deadline to Send. It does not validate its arguments.
 func NewMailgunSender(apiKey, domain, defaultFrom string) *MailgunSender {
 	return newMailgunSender(apiKey, domain, defaultFrom, &http.Client{}, MailgunConfig{})
 }
 
 // NewMailgunSenderWithConfig is like NewMailgunSender but accepts Mailgun-specific
 // configuration, such as choosing the US endpoint instead of the default EU endpoint.
+// An unrecognized Region falls back to the EU endpoint; the factory's NewSender
+// rejects unrecognized regions instead.
 func NewMailgunSenderWithConfig(apiKey, domain, defaultFrom string, config MailgunConfig) *MailgunSender {
 	return newMailgunSender(apiKey, domain, defaultFrom, &http.Client{}, config)
 }
 
-// NewMailgunSenderWithClient is like NewMailgunSender but accepts a custom
-// http.Client (useful for testing with a stubbed transport).
+// NewMailgunSenderWithClient is like NewMailgunSender but uses client for HTTP
+// requests, which is useful for testing with a stubbed transport. client must be
+// non-nil and is used as-is; a client without its own Timeout relies on the
+// context passed to Send for deadlines.
 func NewMailgunSenderWithClient(apiKey, domain, defaultFrom string, client *http.Client) *MailgunSender {
 	return newMailgunSender(apiKey, domain, defaultFrom, client, MailgunConfig{})
 }
@@ -85,6 +92,15 @@ type mailgunErrorResp struct {
 	Message string `json:"message"`
 }
 
+// Send delivers msg through the Mailgun API. If msg.From is empty, the sender's
+// defaultFrom is used.
+//
+// It returns an error wrapping ErrTransient for transport failures, 5xx
+// responses, rate limiting (HTTP 429), and response-read failures (including
+// oversized bodies), and one wrapping ErrPermanent for other 4xx responses and
+// request-construction failures.
+// Cancelling ctx aborts the request; the resulting transport error is wrapped
+// as ErrTransient but does not necessarily wrap ctx.Err().
 func (s *MailgunSender) Send(ctx context.Context, msg Message) error {
 	from := msg.From
 	if from == "" {

@@ -6,12 +6,15 @@ import (
 )
 
 // MockSender is a test double for Sender that captures messages in memory.
+// The zero value is ready to use and behaves like NewMockSender. All methods
+// are safe for concurrent use. Send ignores the context; the order in which
+// concurrent Sends are recorded is unspecified.
 type MockSender struct {
 	mu   sync.Mutex
 	sent []Message
 
-	// InjectErr is the error to return for the next N calls to Send.
-	// Set this before calling Send to simulate failures.
+	// injectErr is returned for the next injectCount calls to Send, after which
+	// it is cleared. Use SetError to configure it.
 	injectErr   error
 	injectCount int
 }
@@ -21,7 +24,9 @@ func NewMockSender() *MockSender {
 	return &MockSender{}
 }
 
-// Send records the message and returns nil, unless an error has been injected.
+// Send appends a copy of msg to the captured messages and returns nil, unless an
+// error configured with SetError is still pending, in which case it returns
+// that error instead. The context is ignored.
 func (m *MockSender) Send(_ context.Context, msg Message) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -39,7 +44,8 @@ func (m *MockSender) Send(_ context.Context, msg Message) error {
 	return nil
 }
 
-// Sent returns a copy of all messages captured so far.
+// Sent returns a copy of the captured messages, so callers may retain or modify
+// the slice without affecting the mock.
 func (m *MockSender) Sent() []Message {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -48,7 +54,9 @@ func (m *MockSender) Sent() []Message {
 	return out
 }
 
-// SetError configures the mock to return err for the next n calls to Send.
+// SetError configures the mock to return err from the next n calls to Send,
+// after which it reverts to recording messages. A nil err or n less than 1
+// disables the pending error.
 func (m *MockSender) SetError(err error, n int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

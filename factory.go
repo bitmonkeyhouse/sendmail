@@ -23,7 +23,7 @@ const (
 type Config struct {
 	// Provider chooses which Sender implementation to create.
 	Provider Provider
-	// DefaultFrom is used when Message.From is empty.
+	// DefaultFrom is required and is used when Message.From is empty.
 	DefaultFrom string
 
 	// ResendAPIKey is required when Provider is ProviderResend.
@@ -38,7 +38,7 @@ type Config struct {
 
 	// SMTPHost is required when Provider is ProviderSMTP.
 	SMTPHost string
-	// SMTPPort is required when Provider is ProviderSMTP.
+	// SMTPPort must be between 1 and 65535 when Provider is ProviderSMTP.
 	SMTPPort int
 	// SMTPMode selects SMTP security. The zero value requires STARTTLS.
 	SMTPMode SMTPMode
@@ -49,6 +49,12 @@ type Config struct {
 }
 
 // NewSender creates a Sender for config.Provider.
+//
+// Unlike the provider constructors, it validates config immediately: the
+// provider must be resend, mailgun, or smtp; DefaultFrom must be nonblank; and
+// provider-specific fields must be present, with Mailgun regions and SMTP modes
+// checked. It returns an error describing the first missing or invalid field.
+// Defaults remain the provider defaults (Mailgun EU, SMTP STARTTLS).
 func NewSender(config Config) (Sender, error) {
 	provider := normalizeProvider(config.Provider)
 	if provider == "" {
@@ -94,11 +100,12 @@ func NewSender(config Config) (Sender, error) {
 
 // NewSenderFromEnv creates a Sender from environment variables.
 //
-// EMAIL_PROVIDER must be one of resend, mailgun, or smtp. EMAIL_FROM configures
-// the default sender address. Provider-specific variables are RESEND_API_KEY;
+// EMAIL_PROVIDER must be one of resend, mailgun, or smtp. EMAIL_FROM is required
+// and configures the default sender address. Provider-specific variables are RESEND_API_KEY;
 // MAILGUN_API_KEY, MAILGUN_DOMAIN, and optional MAILGUN_REGION; or SMTP_HOST,
 // SMTP_PORT, SMTP_USER, SMTP_PASSWORD, and optional SMTP_MODE (starttls by default).
-// Only explicit dev-loopback mode may omit SMTP credentials.
+// Only explicit dev-loopback mode may omit SMTP credentials. Values are validated
+// by NewSender, so configuration errors are returned before any mail is sent.
 func NewSenderFromEnv() (Sender, error) {
 	config, err := configFromEnv()
 	if err != nil {
