@@ -19,6 +19,10 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
       - name: Release merged PR
         env:
           GH_TOKEN: ${{ github.token }}
@@ -40,4 +44,6 @@ jobs:
             patch=$((patch + 1))
           fi
 
-          gh release create "v$major.$minor.$patch" --target main --generate-notes --notes-start-tag "$latest"
+          version="v$major.$minor.$patch"
+          gh release create "$version" --target main --generate-notes --notes-start-tag "$latest"
+          GOPROXY=https://proxy.golang.org go list -m "github.com/bitmonkeyhouse/sendmail@$version"
