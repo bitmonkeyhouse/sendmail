@@ -5,7 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
 	"net"
+	"net/mail"
 	"net/textproto"
 	"strings"
 	"testing"
@@ -170,6 +174,148 @@ func TestSMTPSender_ExplicitFrom(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out")
+	}
+}
+
+func TestSMTPSender_InvalidHeaders(t *testing.T) {
+	for _, field := range []string{"From", "To", "Subject", "Reply-To", "DefaultFrom"} {
+		cases := []struct {
+			name  string
+			value string
+		}{
+			{"CR", "valid@example.com\rBcc: injected@example.com"},
+			{"LF", "valid@example.com\nBcc: injected@example.com"},
+			{"CRLF", "valid@example.com\r\nBcc: injected@example.com"},
+			{"header_termination", "valid@example.com\r\n\r\ninjected body"},
+		}
+		if field != "Subject" {
+			cases = append(cases,
+				struct{ name, value string }{"malformed", "not-an-address"},
+				struct{ name, value string }{"multiple", "a@example.com, b@example.com"},
+			)
+			if field != "Reply-To" {
+				cases = append(cases, struct{ name, value string }{"empty", ""})
+			}
+		}
+		for _, tc := range cases {
+			t.Run(field+"/"+tc.name, func(t *testing.T) {
+				defaultFrom := "default@example.com"
+				msg := Message{To: "to@example.com", Subject: "Test", ReplyTo: "reply@example.com"}
+				switch field {
+				case "From":
+					msg.From = tc.value
+					// An empty explicit From falls back to the default.
+					defaultFrom = tc.value
+				case "To":
+					msg.To = tc.value
+				case "Subject":
+					msg.Subject = tc.value
+				case "Reply-To":
+					msg.ReplyTo = tc.value
+				case "DefaultFrom":
+					defaultFrom = tc.value
+				}
+				// Port zero refuses connections, so reaching the network would
+				// yield ErrTransient instead of the required validation error.
+				sender := NewSMTPSender("127.0.0.1", 0, "", "", defaultFrom)
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				err := sender.Send(ctx, msg)
+				if !errors.Is(err, ErrPermanent) || errors.Is(err, ErrTransient) {
+					t.Fatalf("expected ErrPermanent before dialing, got %v", err)
+				}
+				wantField := field
+				if field == "DefaultFrom" {
+					wantField = "From"
+				}
+				if !strings.Contains(err.Error(), wantField) {
+					t.Errorf("error should identify %s, got %v", wantField, err)
+				}
+			})
+		}
+	}
+}
+
+func TestSMTPSender_EncodedHeaders(t *testing.T) {
+	for _, explicitFrom := range []bool{false, true} {
+		for _, replyTo := range []string{"", "Réponse <reply@example.com>"} {
+			t.Run(fmt.Sprintf("explicitFrom=%t/replyTo=%t", explicitFrom, replyTo != ""), func(t *testing.T) {
+				port, msgCh := startFakeSMTP(t)
+				from := "Équipe <sender@example.com>"
+				defaultFrom := from
+				msg := Message{
+					To:       "Zoë <to@example.com>",
+					Subject:  strings.Repeat("Bienvenue, 世界! ", 10) + "Fin",
+					ReplyTo:  replyTo,
+					TextBody: "First line\nBcc: body text\nLast line",
+					HTMLBody: "<p>First line</p>\n<p>Last line</p>",
+				}
+				if explicitFrom {
+					msg.From = from
+					defaultFrom = "invalid\r\ndefault"
+				}
+				sender := NewSMTPSender("127.0.0.1", port, "", "", defaultFrom)
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := sender.Send(ctx, msg); err != nil {
+					t.Fatalf("Send: %v", err)
+				}
+				var res fakeSMTPMessage
+				select {
+				case res = <-msgCh:
+				case <-ctx.Done():
+					t.Fatal("timed out waiting for fake SMTP server")
+				}
+				if res.from != "sender@example.com" || len(res.to) != 1 || res.to[0] != "to@example.com" {
+					t.Errorf("unexpected envelope: from=%q to=%v", res.from, res.to)
+				}
+				parsed, err := mail.ReadMessage(strings.NewReader(res.body))
+				if err != nil {
+					t.Fatalf("ReadMessage: %v", err)
+				}
+				for header, value := range map[string]string{"From": from, "To": msg.To, "Reply-To": replyTo} {
+					if value == "" {
+						if _, present := parsed.Header[header]; present {
+							t.Errorf("%s should be omitted", header)
+						}
+						continue
+					}
+					addresses, err := parsed.Header.AddressList(header)
+					want, wantErr := mail.ParseAddress(value)
+					if err != nil || wantErr != nil || len(addresses) != 1 || *addresses[0] != *want {
+						t.Errorf("%s did not round-trip: %v (error %v)", header, addresses, err)
+					}
+					if wantErr == nil && parsed.Header.Get(header) != want.String() {
+						t.Errorf("%s should use canonical address encoding, got %q", header, parsed.Header.Get(header))
+					}
+				}
+				if !strings.HasPrefix(parsed.Header.Get("Subject"), "=?utf-8?q?") {
+					t.Errorf("Subject should be RFC 2047 encoded, got %q", parsed.Header.Get("Subject"))
+				}
+				decoded, err := new(mime.WordDecoder).DecodeHeader(parsed.Header.Get("Subject"))
+				if err != nil || decoded != msg.Subject {
+					t.Errorf("Subject did not round-trip: %q (error %v)", decoded, err)
+				}
+				if parsed.Header.Get("Bcc") != "" {
+					t.Error("body text must not become a Bcc header")
+				}
+				_, params, err := mime.ParseMediaType(parsed.Header.Get("Content-Type"))
+				if err != nil {
+					t.Fatalf("ParseMediaType: %v", err)
+				}
+				reader := multipart.NewReader(parsed.Body, params["boundary"])
+				for _, want := range []string{msg.TextBody, msg.HTMLBody} {
+					part, err := reader.NextPart()
+					if err != nil {
+						t.Fatalf("NextPart: %v", err)
+					}
+					body, err := io.ReadAll(part)
+					if err != nil || string(body) != want {
+						t.Errorf("body changed: %q (error %v)", body, err)
+					}
+				}
+			})
+		}
 	}
 }
 

@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"mime"
+	"net/mail"
 	"net/smtp"
 	"net/textproto"
 	"strings"
@@ -32,10 +34,16 @@ func NewSMTPSender(host string, port int, user, password, from string) *SMTPSend
 	}
 }
 
+// Send rejects line breaks in headers and invalid mailbox addresses with ErrPermanent.
 func (s *SMTPSender) Send(ctx context.Context, msg Message) error {
 	from := msg.From
 	if from == "" {
 		from = s.from
+	}
+
+	headers, from, to, err := prepareSMTPHeaders(from, msg)
+	if err != nil {
+		return err
 	}
 
 	addr := fmt.Sprintf("%s:%d", s.host, s.port)
@@ -53,12 +61,7 @@ func (s *SMTPSender) Send(ctx context.Context, msg Message) error {
 	}
 
 	var b strings.Builder
-	b.WriteString("From: " + from + "\r\n")
-	b.WriteString("To: " + msg.To + "\r\n")
-	b.WriteString("Subject: " + msg.Subject + "\r\n")
-	if msg.ReplyTo != "" {
-		b.WriteString("Reply-To: " + msg.ReplyTo + "\r\n")
-	}
+	b.WriteString(headers)
 	b.WriteString("MIME-Version: 1.0\r\n")
 	fmt.Fprintf(&b, "Content-Type: multipart/alternative; boundary=%s\r\n\r\n", boundary)
 	fmt.Fprintf(&b, "--%s\r\n", boundary)
@@ -71,7 +74,7 @@ func (s *SMTPSender) Send(ctx context.Context, msg Message) error {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- smtp.SendMail(addr, auth, from, []string{msg.To}, []byte(b.String()))
+		done <- smtp.SendMail(addr, auth, from, []string{to}, []byte(b.String()))
 	}()
 
 	select {
@@ -80,6 +83,47 @@ func (s *SMTPSender) Send(ctx context.Context, msg Message) error {
 	case err := <-done:
 		return classifySMTPError(err)
 	}
+}
+
+// prepareSMTPHeaders returns serialized headers and bare SMTP envelope addresses.
+func prepareSMTPHeaders(from string, msg Message) (string, string, string, error) {
+	fields := []struct {
+		name  string
+		value string
+	}{
+		{"From", from},
+		{"To", msg.To},
+		{"Subject", msg.Subject},
+		{"Reply-To", msg.ReplyTo},
+	}
+	var headers strings.Builder
+	var envelopeFrom, envelopeTo string
+	for _, field := range fields {
+		if field.name == "Reply-To" && field.value == "" {
+			continue
+		}
+		if strings.ContainsAny(field.value, "\r\n") {
+			return "", "", "", fmt.Errorf("%w: SMTP %s contains a line break", ErrPermanent, field.name)
+		}
+		value := field.value
+		if field.name == "Subject" {
+			value = mime.QEncoding.Encode("utf-8", value)
+		} else {
+			address, err := mail.ParseAddress(value)
+			if err != nil {
+				return "", "", "", fmt.Errorf("%w: invalid SMTP %s address: %v", ErrPermanent, field.name, err)
+			}
+			value = address.String()
+			switch field.name {
+			case "From":
+				envelopeFrom = address.Address
+			case "To":
+				envelopeTo = address.Address
+			}
+		}
+		fmt.Fprintf(&headers, "%s: %s\r\n", field.name, value)
+	}
+	return headers.String(), envelopeFrom, envelopeTo, nil
 }
 
 // classifySMTPError maps net/smtp errors to ErrTransient or ErrPermanent.
