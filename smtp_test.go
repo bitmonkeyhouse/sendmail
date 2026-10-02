@@ -3,12 +3,16 @@ package sendmail
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
 	"net"
+	"net/http/httptest"
 	"net/mail"
 	"net/textproto"
 	"strings"
@@ -362,5 +366,383 @@ func TestSMTPSender_ClassifyNetworkError(t *testing.T) {
 func TestSMTPSender_ClassifyNoError(t *testing.T) {
 	if err := classifySMTPError(nil); err != nil {
 		t.Fatalf("expected nil, got: %v", err)
+	}
+}
+
+// startSMTPPeer owns both sides of server cleanup, even if Send leaks a socket.
+func startSMTPPeer(t *testing.T, serve func(net.Conn) error) (int, <-chan error) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		conn, err := ln.Accept()
+		if err != nil {
+			result <- err
+			return
+		}
+		defer conn.Close()
+		stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+		defer stop()
+		if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			result <- err
+			return
+		}
+		result <- serve(conn)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = ln.Close()
+		select {
+		case <-exited:
+		case <-time.After(2 * time.Second):
+			t.Error("SMTP peer did not stop")
+		}
+	})
+	return ln.Addr().(*net.TCPAddr).Port, result
+}
+
+func TestSMTPSender_AuthAdvertisement(t *testing.T) {
+	for _, tc := range []struct {
+		helo        bool
+		credentials bool
+	}{{false, false}, {true, false}, {false, true}, {true, true}} {
+		t.Run(fmt.Sprintf("HELO=%t/credentials=%t", tc.helo, tc.credentials), func(t *testing.T) {
+			port, peerResult := startSMTPPeer(t, func(conn net.Conn) error {
+				peer := textproto.NewConn(conn)
+				if err := peer.PrintfLine("220 ready"); err != nil {
+					return err
+				}
+				type exchange struct{ command, reply string }
+				commands := []exchange{{"EHLO ", "250 peer"}}
+				if tc.helo {
+					commands[0].reply = "500 EHLO unsupported"
+					commands = append(commands, exchange{"HELO ", "250 peer"})
+				}
+				commands = append(commands,
+					exchange{"MAIL FROM:", "250 OK"},
+					exchange{"RCPT TO:", "250 OK"},
+					exchange{"DATA", "354 send data"},
+					exchange{"QUIT", "221 bye"},
+				)
+				for _, step := range commands {
+					line, err := peer.ReadLine()
+					if tc.credentials && step.command == "MAIL FROM:" {
+						if err != io.EOF {
+							return fmt.Errorf("expected closure without AUTH, got %q: %v", line, err)
+						}
+						return nil
+					}
+					if err != nil || !strings.HasPrefix(line, step.command) {
+						return fmt.Errorf("expected %s, got %q: %v", step.command, line, err)
+					}
+					if err := peer.PrintfLine("%s", step.reply); err != nil {
+						return err
+					}
+					if step.command == "DATA" {
+						if _, err := peer.ReadDotBytes(); err != nil {
+							return err
+						}
+						if err := peer.PrintfLine("250 accepted"); err != nil {
+							return err
+						}
+					}
+				}
+				return nil
+			})
+			user, password := "", ""
+			if tc.credentials {
+				user, password = "user", "pass"
+			}
+			sender := NewSMTPSender("127.0.0.1", port, user, password, "from@example.com")
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			err := sender.Send(ctx, Message{To: "to@example.com"})
+			if tc.credentials {
+				if !errors.Is(err, ErrTransient) || !strings.Contains(err.Error(), "server doesn't support AUTH") {
+					t.Fatalf("expected missing AUTH error, got %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-peerResult:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-ctx.Done():
+				t.Fatal("peer did not finish")
+			}
+		})
+	}
+}
+
+func TestSMTPSender_STARTTLSVerifiesCertificate(t *testing.T) {
+	// Reuse the standard library's self-signed test certificate; production
+	// verification must reject it rather than proceed to MAIL or AUTH.
+	fixture := httptest.NewTLSServer(nil)
+	defer fixture.Close()
+	port, peerResult := startSMTPPeer(t, func(conn net.Conn) error {
+		reader := bufio.NewReader(conn)
+		if _, err := io.WriteString(conn, "220 ready\r\n"); err != nil {
+			return err
+		}
+		if line, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(line, "EHLO ") {
+			return fmt.Errorf("expected EHLO, got %q: %v", line, err)
+		}
+		if _, err := io.WriteString(conn, "250-peer\r\n250 STARTTLS\r\n"); err != nil {
+			return err
+		}
+		if line, err := reader.ReadString('\n'); err != nil || line != "STARTTLS\r\n" {
+			return fmt.Errorf("expected STARTTLS, got %q: %v", line, err)
+		}
+		if _, err := io.WriteString(conn, "220 start TLS\r\n"); err != nil {
+			return err
+		}
+		if err := tls.Server(conn, fixture.TLS).Handshake(); err == nil {
+			return errors.New("client accepted an untrusted certificate")
+		}
+		return nil
+	})
+	sender := NewSMTPSender("127.0.0.1", port, "user", "pass", "from@example.com")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := sender.Send(ctx, Message{To: "to@example.com"})
+	if !errors.Is(err, ErrTransient) || !strings.Contains(err.Error(), "certificate") {
+		t.Fatalf("expected certificate verification failure, got %v", err)
+	}
+	select {
+	case err := <-peerResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("TLS peer did not finish")
+	}
+}
+
+func TestSMTPSender_STARTTLSDelivery(t *testing.T) {
+	fixture := httptest.NewTLSServer(nil)
+	defer fixture.Close()
+	// Trust only this fixture, with normal certificate and IP verification.
+	roots := x509.NewCertPool()
+	roots.AddCert(fixture.Certificate())
+	const host = "127.0.0.1"
+	tlsConfig := &tls.Config{ServerName: host, RootCAs: roots}
+	msg := Message{
+		To:       "Recipient <to@example.com>",
+		Subject:  "TLS delivery",
+		TextBody: "Delivered after STARTTLS",
+		HTMLBody: "<p>Delivered after STARTTLS</p>",
+	}
+	port, peerResult := startSMTPPeer(t, func(conn net.Conn) error {
+		peer := textproto.NewConn(conn)
+		exchange := func(command, reply string) error {
+			line, err := peer.ReadLine()
+			if err != nil || line != command {
+				return fmt.Errorf("expected %s, got %q: %v", command, line, err)
+			}
+			return peer.PrintfLine("%s", reply)
+		}
+		if err := peer.PrintfLine("220 ready"); err != nil {
+			return err
+		}
+		if err := exchange("EHLO localhost", "250-peer\r\n250 STARTTLS"); err != nil {
+			return err
+		}
+		if err := exchange("STARTTLS", "220 start TLS"); err != nil {
+			return err
+		}
+		secure := tls.Server(conn, fixture.TLS)
+		if err := secure.Handshake(); err != nil {
+			return err
+		}
+		// Every subsequent command is read from the encrypted connection.
+		peer = textproto.NewConn(secure)
+		if err := exchange("EHLO localhost", "250-peer\r\n250 AUTH PLAIN"); err != nil {
+			return err
+		}
+		credentials := base64.StdEncoding.EncodeToString([]byte("\x00user\x00pass"))
+		for _, step := range []struct{ command, reply string }{
+			{"AUTH PLAIN " + credentials, "235 authenticated"},
+			{"MAIL FROM:<from@example.com>", "250 OK"},
+			{"RCPT TO:<to@example.com>", "250 OK"},
+			{"DATA", "354 send data"},
+		} {
+			if err := exchange(step.command, step.reply); err != nil {
+				return err
+			}
+		}
+		body, err := peer.ReadDotBytes()
+		if err != nil {
+			return err
+		}
+		for _, want := range []string{"Subject: " + msg.Subject, msg.TextBody, msg.HTMLBody} {
+			if !strings.Contains(string(body), want) {
+				return fmt.Errorf("delivered message missing %q", want)
+			}
+		}
+		if err := peer.PrintfLine("250 accepted"); err != nil {
+			return err
+		}
+		return exchange("QUIT", "221 bye")
+	})
+	sender := NewSMTPSender(host, port, "user", "pass", "Sender <from@example.com>")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := sender.send(ctx, msg, 30*time.Second, tlsConfig); err != nil {
+		t.Fatalf("Send with verified STARTTLS: %v", err)
+	}
+	select {
+	case err := <-peerResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("TLS peer did not finish")
+	}
+}
+
+func TestSMTPSender_AlreadyCanceled(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	sender := NewSMTPSender("127.0.0.1", ln.Addr().(*net.TCPAddr).Port, "", "", "from@example.com")
+	err = sender.Send(ctx, Message{To: "to@example.com"})
+	if !errors.Is(err, ErrTransient) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected transient cancellation, got %v", err)
+	}
+	if err := ln.(*net.TCPListener).SetDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := ln.Accept()
+	if err == nil {
+		conn.Close()
+		t.Fatal("already-canceled send opened a connection")
+	}
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("Accept: %v", err)
+	}
+}
+
+func TestSMTPSender_StallsCloseConnection(t *testing.T) {
+	for _, stage := range []string{"greeting", "mail", "data", "tls"} {
+		for _, mode := range []string{"cancel", "caller_deadline", "fallback_deadline"} {
+			t.Run(stage+"/"+mode, func(t *testing.T) {
+				ready := make(chan struct{})
+				port, peerResult := startSMTPPeer(t, func(conn net.Conn) error {
+					reader := bufio.NewReader(conn)
+					step := func(reply, command string) error {
+						if _, err := io.WriteString(conn, reply); err != nil {
+							return err
+						}
+						line, err := reader.ReadString('\n')
+						if err != nil {
+							return err
+						}
+						if !strings.HasPrefix(line, command) {
+							return fmt.Errorf("expected %s, got %q", command, line)
+						}
+						return nil
+					}
+					if stage != "greeting" {
+						if err := step("220 ready\r\n", "EHLO "); err != nil {
+							return err
+						}
+						if stage == "tls" {
+							if err := step("250-peer\r\n250 STARTTLS\r\n", "STARTTLS\r\n"); err != nil {
+								return err
+							}
+							if _, err := io.WriteString(conn, "220 start TLS\r\n"); err != nil {
+								return err
+							}
+						} else {
+							if err := step("250 peer\r\n", "MAIL FROM:"); err != nil {
+								return err
+							}
+							if stage == "data" {
+								if err := step("250 OK\r\n", "RCPT TO:"); err != nil {
+									return err
+								}
+								if err := step("250 OK\r\n", "DATA\r\n"); err != nil {
+									return err
+								}
+								if _, err := io.WriteString(conn, "354 send data\r\n"); err != nil {
+									return err
+								}
+								for {
+									line, err := reader.ReadString('\n')
+									if err != nil {
+										return err
+									}
+									if line == ".\r\n" {
+										break
+									}
+								}
+							}
+						}
+					}
+					close(ready)
+					// EOF proves the client closed the socket; a timeout is failure.
+					_, err := io.Copy(io.Discard, reader)
+					return err
+				})
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				if mode == "caller_deadline" {
+					var deadlineCancel context.CancelFunc
+					ctx, deadlineCancel = context.WithTimeout(ctx, time.Second)
+					defer deadlineCancel()
+				}
+				sender := NewSMTPSender("127.0.0.1", port, "", "", "from@example.com")
+				result := make(chan error, 1)
+				go func() {
+					msg := Message{To: "to@example.com", TextBody: "hello"}
+					if mode == "fallback_deadline" {
+						result <- sender.send(ctx, msg, time.Second, nil)
+					} else {
+						result <- sender.Send(ctx, msg)
+					}
+				}()
+				select {
+				case <-ready:
+				case err := <-peerResult:
+					t.Fatalf("peer failed before stall: %v", err)
+				case <-time.After(3 * time.Second):
+					t.Fatal("peer did not reach stall")
+				}
+				want := context.DeadlineExceeded
+				if mode == "cancel" {
+					want = context.Canceled
+					cancel()
+				}
+				select {
+				case err := <-result:
+					if !errors.Is(err, ErrTransient) || !errors.Is(err, want) {
+						t.Fatalf("expected transient %v, got %v", want, err)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("Send did not return promptly")
+				}
+				select {
+				case err := <-peerResult:
+					if err != nil {
+						t.Fatalf("peer did not observe clean socket closure: %v", err)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("Send returned without closing its socket")
+				}
+			})
+		}
 	}
 }
