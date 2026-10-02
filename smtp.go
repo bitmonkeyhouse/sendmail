@@ -110,7 +110,7 @@ func (s *SMTPSender) send(ctx context.Context, msg Message, timeout time.Duratio
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 	deadline, _ := ctx.Deadline()

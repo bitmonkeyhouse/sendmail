@@ -386,7 +386,7 @@ func startSMTPPeer(t *testing.T, serve func(net.Conn) error) (int, <-chan error)
 			result <- err
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 		defer stop()
 		if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
@@ -613,7 +613,7 @@ func TestSMTPSender_AlreadyCanceled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	sender := NewSMTPSender("127.0.0.1", ln.Addr().(*net.TCPAddr).Port, "", "", "from@example.com")
@@ -626,7 +626,7 @@ func TestSMTPSender_AlreadyCanceled(t *testing.T) {
 	}
 	conn, err := ln.Accept()
 	if err == nil {
-		conn.Close()
+		_ = conn.Close()
 		t.Fatal("already-canceled send opened a connection")
 	}
 	var netErr net.Error
